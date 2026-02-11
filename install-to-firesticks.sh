@@ -1,100 +1,85 @@
-#!/bin/bash
+#!/usr/bin/env bash
+set -euo pipefail
 
-ADB="./adb"
-APK_DIR="./apks"
-MAX_PARALLEL=25
-TIMEOUT=1
+# Optional: Pass IPs as args to override scanning (e.g., ./script.sh 192.168.2.164)
+MANUAL_IPS=("$@")
 
-command -v adb >/dev/null || { echo "❌ adb not found"; exit 1; }
+# 1) Detect local IP and /24 subnet prefix
+get_local_ip() {
+  ifconfig | awk '/inet 192.168/ { print $2; exit }'  # Broader detection for any 192.168.x.x interface
+}
+LOCAL_IP=$(get_local_ip)
+[[ -n "$LOCAL_IP" ]] || {
+  echo "❌ Could not detect local IP on 192.168.x.x; are you on Wi-Fi/Ethernet?" >&2
+  exit 1
+}
+SUBNET_PREFIX="${LOCAL_IP%.*}"
+echo "🔍 Scanning ${SUBNET_PREFIX}.0/24 for Amazon-OEM MACs…"
 
-echo "🔥 FireTV Fleet Installer"
-echo "=========================="
-
-# --- Get active interfaces ---
-INTERFACES=$(route get default 2>/dev/null | awk '/interface:/{print $2}')
-
-declare -A SUBNETS
-
-for IFACE in $INTERFACES; do
-    IP=$(ipconfig getifaddr "$IFACE" 2>/dev/null) || continue
-    SUBNET=$(echo "$IP" | awk -F. '{print $1"."$2"."$3}')
-    SUBNETS["$SUBNET"]=1
-done
-
-if [ ${#SUBNETS[@]} -eq 0 ]; then
-    echo "❌ No active subnets found"
-    exit 1
+# 2) Ping-scan + MAC OUI filter for Amazon devices
+declare -a FIRE_IPS
+if (( ${#MANUAL_IPS[@]} > 0 )); then
+  FIRE_IPS=("${MANUAL_IPS[@]}")
+  echo "Using manual IPs: ${FIRE_IPS[*]}"
+else
+  while read -r ip; do
+    FIRE_IPS+=("$ip")
+  done < <(
+    nmap -sn -n "${SUBNET_PREFIX}.0/24" \
+        | awk '/Nmap scan report for/ { ip=$NF }
+         /MAC Address: .*Amazon/    { print ip }'
+  )
 fi
 
-echo "🌐 Subnets detected:"
-for S in "${!SUBNETS[@]}"; do
-    echo "   • $S.0/24"
-done
-echo ""
+if (( ${#FIRE_IPS[@]} == 0 )); then
+  echo "⚠️ No Fire Sticks found (no Amazon OUIs). Try running with sudo or manual IPs." >&2
+  exit 1
+fi
 
-# --- FireTV detection ---
-is_fire_tv() {
-    local serial=$1
-    MODEL=$($ADB -s "$serial" shell getprop ro.product.model 2>/dev/null | tr -d '\r')
-    BRAND=$($ADB -s "$serial" shell getprop ro.product.brand 2>/dev/null | tr -d '\r')
+echo "✅ Found/targeted Fire Sticks at: ${FIRE_IPS[*]}"
 
-    [[ "$MODEL" == *"AFT"* || "$MODEL" == *"Fire"* || "$BRAND" == *"Amazon"* ]]
-}
+# 3) Gather APKs
+APK_DIR="./apks"
+shopt -s nullglob
+APKS=( "$APK_DIR"/*.apk )
+if (( ${#APKS[@]} == 0 )); then
+  echo "❌ No APKs found in $APK_DIR." >&2
+  exit 1
+fi
 
-# --- Get installed packages ---
-get_installed_packages() {
-    $ADB -s "$1" shell pm list packages 2>/dev/null | sed 's/package://'
-}
-
-# --- Optional cleanup ---
-cleanup_storage() {
-    echo "🧹 Cleaning cache..."
-    $ADB -s "$1" shell pm trim-caches 1G >/dev/null 2>&1
-}
-
-# --- Install APKs ---
-install_apks() {
-    local serial=$1
-    local installed
-    installed=$(get_installed_packages "$serial")
-
-    for APK in "$APK_DIR"/*.apk; do
-        PKG=$(aapt dump badging "$APK" 2>/dev/null | awk -F"'" '/package: name=/{print $2}')
-
-        if echo "$installed" | grep -q "^$PKG$"; then
-            echo "   ⏭️  Skipping $(basename "$APK") (already installed)"
-        else
-            echo "   📦 Installing $(basename "$APK")"
-            $ADB -s "$serial" install -r "$APK" >/dev/null 2>&1 \
-                && echo "   ✅ Installed" \
-                || echo "   ❌ Failed"
-        fi
+# 4) For each Fire Stick, connect and install
+for IP in "${FIRE_IPS[@]}"; do
+  echo "----"
+  echo "📱 Connecting to $IP:5555…"
+  if adb connect "$IP:5555" 2>&1 | grep -iqE 'connected|already'; then
+    echo "✅ Connected to $IP"
+    
+    # Optional cleanup - ignore failures so script continues
+    echo "  → Attempting to clear caches (may be restricted)…"
+    adb -s "$IP:5555" shell pm trim-caches 999G 2>/dev/null || echo "    ⚠️ Cache clear blocked/skipped"
+    
+    # Skip force-stop on protected packages - it's not essential for installs
+    # If you had this line, comment it out or add || true
+    # adb -s "$IP:5555" shell am force-stop com.amazon.tv.launcher || true
+    
+    # Optional: Go to home screen to "wake" device
+    adb -s "$IP:5555" shell input keyevent 3 || true
+    
+    # Now install APKs - this should run regardless
+    for APK in "${APKS[@]}"; do
+      echo "  → Installing $(basename "$APK")"
+      if adb -s "$IP:5555" install -r "$APK"; then
+        echo "    ✔️ Success"
+      else
+        echo "    ⚠️ Failed - check APK compatibility or storage"
+      fi
     done
-}
-
-export -f is_fire_tv get_installed_packages cleanup_storage install_apks
-
-# --- Scan function ---
-scan_ip() {
-    local IP=$1
-    timeout $TIMEOUT adb connect "$IP:5555" >/dev/null 2>&1 || return
-
-    if is_fire_tv "$IP:5555"; then
-        MODEL=$(adb -s "$IP:5555" shell getprop ro.product.model | tr -d '\r')
-        echo "🔥 Fire TV FOUND: $MODEL @ $IP"
-
-        cleanup_storage "$IP:5555"
-        install_apks "$IP:5555"
-    fi
-}
-
-export -f scan_ip
-
-# --- Parallel scan ---
-for SUBNET in "${!SUBNETS[@]}"; do
-    echo "🔍 Scanning subnet $SUBNET.0/24"
-    seq 1 254 | xargs -P $MAX_PARALLEL -I{} bash -c "scan_ip $SUBNET.{}"
+    
+    # Optional disconnect
+    adb disconnect "$IP:5555" >/dev/null
+  else
+    echo "⏭ Could not connect to ADB on $IP"
+  fi
 done
 
-echo ""
-echo "🎉 Deployment complete"
+echo "🎉 All done!"
